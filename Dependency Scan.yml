@@ -1,0 +1,186 @@
+# ============================================================
+# .gitlab-ci.yml — Security Pipeline (Шаг 2: Dependency Scan)
+# Trivy сканирует requirements.txt и Docker-образ
+# Critical CVE → pipeline падает, деплой блокируется
+# ============================================================
+
+stages:
+  - sast
+  - secrets
+  - dependency-scan
+  - docker-scan
+  - deploy
+
+variables:
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  TRIVY_VERSION: "0.50.1"
+
+# ── 1. SAST — Semgrep ─────────────────────────────────────────────────────────
+semgrep:
+  stage: sast
+  image: python:3.11-slim
+  before_script:
+    - pip install semgrep -q
+  script:
+    - echo "=== Running Semgrep SAST ==="
+    - semgrep --config=.semgrep.yml
+              --severity=ERROR
+              --json
+              --output=semgrep-results.json
+              app/ || (echo "❌ Critical findings — pipeline blocked" && exit 1)
+    - echo "✅ SAST passed — no Critical findings"
+  artifacts:
+    when: always
+    paths:
+      - semgrep-results.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ── 2. Secrets — Gitleaks ─────────────────────────────────────────────────────
+gitleaks:
+  stage: secrets
+  image: zricethezav/gitleaks:latest
+  script:
+    - echo "=== Scanning for secrets ==="
+    - gitleaks detect
+                  --source=.
+                  --config=.gitleaks.toml
+                  --report-format=json
+                  --report-path=gitleaks-report.json
+                  -v || (echo "❌ Secrets found — pipeline blocked" && exit 1)
+    - echo "✅ No secrets detected"
+  artifacts:
+    when: always
+    paths:
+      - gitleaks-report.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ── 3. Dependency Scan — Trivy (requirements.txt) ─────────────────────────────
+trivy-deps:
+  stage: dependency-scan
+  image: aquasec/trivy:latest
+  script:
+    - echo "=== Scanning requirements.txt ==="
+
+    # Сканируем уязвимые зависимости — только для отчёта (не падаем)
+    - trivy fs
+        --scanners vuln
+        --severity CRITICAL,HIGH,MEDIUM
+        --format table
+        requirements.txt || true
+
+    # Сохраняем полный отчёт в JSON
+    - trivy fs
+        --scanners vuln
+        --severity CRITICAL,HIGH,MEDIUM
+        --format json
+        --output trivy-deps.json
+        requirements.txt || true
+
+    # GATE: падаем при Critical или High CVE
+    - trivy fs
+        --scanners vuln
+        --severity CRITICAL,HIGH
+        --exit-code 1
+        requirements.txt
+        && echo "✅ No Critical/High CVE — gate passed"
+        || (echo "❌ Critical/High CVE found — pipeline blocked" && exit 1)
+
+  artifacts:
+    when: always
+    paths:
+      - trivy-deps.json
+    reports:
+      # GitLab встроенный Security Dashboard
+      dependency_scanning: trivy-deps.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ── 4. Docker Build ────────────────────────────────────────────────────────────
+docker-build:
+  stage: docker-scan
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - echo "=== Building Docker image ==="
+    - docker build -t "$IMAGE_NAME" .
+    - docker push "$IMAGE_NAME"
+    - echo "✅ Image built and pushed: $IMAGE_NAME"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ── 5. Docker Image Scan — Trivy ──────────────────────────────────────────────
+trivy-image:
+  stage: docker-scan
+  image: aquasec/trivy:latest
+  needs:
+    - docker-build
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+  script:
+    - echo "=== Scanning Docker image: $IMAGE_NAME ==="
+
+    # Полный отчёт
+    - trivy image
+        --severity CRITICAL,HIGH
+        --format sarif
+        --output trivy-image.sarif
+        "$IMAGE_NAME" || true
+
+    # Проверка что контейнер не запускается от root
+    - |
+      USER=$(docker run --rm "$IMAGE_NAME" whoami)
+      echo "Container user: $USER"
+      [ "$USER" != "root" ] \
+        && echo "✅ Non-root user confirmed: $USER" \
+        || (echo "❌ Container runs as root!" && exit 1)
+
+    # GATE: падаем при Critical/High в образе
+    - trivy image
+        --severity CRITICAL,HIGH
+        --exit-code 1
+        "$IMAGE_NAME"
+        && echo "✅ Image scan passed — no Critical/High"
+        || (echo "❌ Critical/High in Docker image — pipeline blocked" && exit 1)
+
+  artifacts:
+    when: always
+    paths:
+      - trivy-image.sarif
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ── 6. Deploy (только main ветка, только если всё выше прошло) ────────────────
+deploy:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - semgrep
+    - gitleaks
+    - trivy-deps
+    - trivy-image
+  environment:
+    name: production
+    url: https://yourdomain.com
+  script:
+    - echo "=== All security gates passed ==="
+    - echo "✅ SAST (Semgrep)        — passed"
+    - echo "✅ Secrets (Gitleaks)    — passed"
+    - echo "✅ Dependencies (Trivy)  — passed"
+    - echo "✅ Docker image (Trivy)  — passed"
+    - echo "=== Deploying to production ==="
+    # Здесь ваш деплой: kubectl apply / docker-compose pull / ssh и т.д.
+    - echo "Deploy step: add your deployment commands here"
+  rules:
+    # Деплой только из main, только если pipeline зелёный
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'

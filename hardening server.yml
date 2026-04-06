@@ -1,0 +1,507 @@
+Задача № 5 для этой задачи не было возможности создать VPS в хостинге
+
+Расписал все по порядку 
+
+
+## 1. Первичная подготовка системы
+
+```bash
+# Обновить все пакеты
+apt-get update && apt-get upgrade -y
+
+# Установить нужные утилиты
+apt-get install -y ufw fail2ban nginx curl wget git unzip
+```
+
+---
+
+## 2. Создать отдельного пользователя для приложения
+
+```bash
+# Создать системного пользователя без логина (не root, без домашней директории)
+useradd --system \
+        --no-create-home \
+        --shell /sbin/nologin \
+        appuser
+
+# Проверить что пользователь создан
+id appuser
+# uid=999(appuser) gid=999(appuser) groups=999(appuser)
+
+# Создать директории приложения и отдать их appuser
+mkdir -p /app/data /app/logs
+chown -R appuser:appuser /app
+chmod 750 /app
+chmod 750 /app/data
+chmod 750 /app/logs
+
+# Проверить права
+ls -la /app
+```
+
+---
+
+## 3. Настройка SSH
+
+### 3.1 Добавить свой публичный ключ (сделать ДО изменения конфига!)
+
+```bash
+# На своей локальной машине — сгенерировать ключ если нет
+ssh-keygen -t ed25519 -C "devsecops@yourdomain.com"
+
+# Скопировать публичный ключ на сервер
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@YOUR_SERVER_IP
+
+# Или вручную на сервере
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+echo "ssh-ed25519 AAAA...ваш_публичный_ключ..." >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+### 3.2 Изменить конфигурацию SSH
+
+```bash
+# Создать hardening-конфиг (не трогаем основной /etc/ssh/sshd_config)
+cat > /etc/ssh/sshd_config.d/99-hardening.conf << 'EOF'
+# Нестандартный порт — усложняет автоматическое сканирование
+Port 2222
+
+# Запрет входа под root
+PermitRootLogin no
+
+# Только ключевая аутентификация (пароли запрещены)
+PasswordAuthentication no
+PubkeyAuthentication yes
+
+# Дополнительные ограничения
+PermitEmptyPasswords no
+X11Forwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+Protocol 2
+EOF
+
+# Проверить конфиг на ошибки перед применением
+sshd -t && echo "Config is valid"
+
+# Применить
+systemctl restart sshd
+
+# ⚠️ ВАЖНО: не закрывать текущую сессию!
+# Открыть НОВОЕ окно терминала и проверить вход:
+# ssh -p 2222 -i ~/.ssh/id_ed25519 YOUR_USER@YOUR_SERVER_IP
+```
+
+---
+
+## 4. UFW — файрвол
+
+```bash
+# Сбросить все правила
+ufw --force reset
+
+# Политика по умолчанию: запрещать входящий, разрешать исходящий
+ufw default deny incoming
+ufw default allow outgoing
+
+# Разрешить только необходимые порты
+ufw allow 2222/tcp comment "SSH custom port"
+ufw allow 80/tcp   comment "HTTP (redirect to HTTPS)"
+ufw allow 443/tcp  comment "HTTPS"
+# Порт 8000 (приложение) НЕ открываем — только через Nginx
+
+# Включить файрвол
+ufw --force enable
+
+# Проверить правила
+ufw status verbose
+```
+
+Ожидаемый вывод:
+```
+Status: active
+
+To                         Action      From
+--                         ------      ----
+2222/tcp                   ALLOW IN    Anywhere   # SSH custom port
+80/tcp                     ALLOW IN    Anywhere   # HTTP
+443/tcp                    ALLOW IN    Anywhere   # HTTPS
+```
+
+---
+
+## 5. fail2ban
+
+### 5.1 Основной конфиг
+
+```bash
+# Создать локальный конфиг (переопределяет /etc/fail2ban/jail.conf)
+cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+# Банить на 1 час
+bantime  = 3600
+# Окно проверки — 10 минут
+findtime = 600
+# Максимум попыток
+maxretry = 5
+backend  = auto
+
+[sshd]
+enabled  = true
+port     = 2222
+filter   = sshd
+logpath  = /var/log/auth.log
+# Для SSH — строже: 3 попытки, бан на 24 часа
+maxretry = 3
+bantime  = 86400
+
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+filter   = nginx-http-auth
+logpath  = /var/log/nginx/error.log
+
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+filter   = nginx-limit-req
+logpath  = /var/log/nginx/error.log
+maxretry = 10
+
+[nginx-botsearch]
+enabled  = true
+port     = http,https
+filter   = nginx-botsearch
+logpath  = /var/log/nginx/access.log
+maxretry = 5
+EOF
+
+# Включить и запустить
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+# Проверить статус
+fail2ban-client status
+fail2ban-client status sshd
+```
+
+---
+
+## 6. Nginx — security headers
+
+### 6.1 Конфигурация
+
+```bash
+# Убрать стандартный конфиг
+rm -f /etc/nginx/sites-enabled/default
+
+# Создать конфиг приложения
+cat > /etc/nginx/sites-available/app.conf << 'EOF'
+# Скрыть версию Nginx
+server_tokens off;
+
+# Rate limiting
+limit_req_zone $binary_remote_addr zone=api:10m    rate=30r/m;
+limit_req_zone $binary_remote_addr zone=login:10m  rate=5r/m;
+
+# HTTP → HTTPS redirect
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name yourdomain.com;
+
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+
+    # Только современные протоколы TLS
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # ── Security Headers ────────────────────────────────────────────────────
+    # Защита от MITM — браузер всегда использует HTTPS
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # Запрет отображения в iframe (защита от Clickjacking)
+    add_header X-Frame-Options "DENY" always;
+
+    # Запрет MIME-sniffing
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # XSS-защита (старые браузеры)
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # Ограничение Referer-заголовка
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Content Security Policy
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+
+    # Запрет лишних возможностей браузера
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+    # Скрыть заголовки backend
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header Server;
+
+    # ── Логи без чувствительных данных ──────────────────────────────────────
+    # Убраны query-параметры ($uri вместо $request) — могут содержать токены
+    log_format secure '$remote_addr - [$time_local] '
+                      '"$request_method $uri $server_protocol" '
+                      '$status $body_bytes_sent "$http_user_agent"';
+
+    access_log /var/log/nginx/access.log secure;
+
+    # ── Проксирование на приложение ──────────────────────────────────────────
+    location / {
+        limit_req zone=api burst=10 nodelay;
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout    30s;
+    }
+
+    # Строгий rate limit для логина
+    location /login {
+        limit_req zone=login burst=3 nodelay;
+        proxy_pass http://127.0.0.1:8000/login;
+    }
+
+    # Запрет скрытых файлов (.env, .git и т.д.)
+    location ~ /\. {
+        deny all;
+        return 404;
+    }
+}
+EOF
+
+# Активировать конфиг
+ln -s /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/
+
+# Проверить конфиг
+nginx -t && echo "Nginx config is valid"
+
+# Применить
+systemctl reload nginx
+```
+
+### 6.2 Проверка security headers
+
+```bash
+# Проверить заголовки (после получения SSL-сертификата)
+curl -I https://yourdomain.com | grep -E "(Strict|X-Frame|X-Content|X-XSS|Content-Security|Referrer|Permissions)"
+
+# Ожидаемый вывод:
+# strict-transport-security: max-age=31536000; includeSubDomains; preload
+# x-frame-options: DENY
+# x-content-type-options: nosniff
+# x-xss-protection: 1; mode=block
+# content-security-policy: default-src 'self'; ...
+# referrer-policy: strict-origin-when-cross-origin
+# permissions-policy: geolocation=(), microphone=(), camera=()
+```
+
+---
+
+## 7. Docker — non-root контейнер
+
+### 7.1 Dockerfile
+
+```dockerfile
+# Многоэтапная сборка
+FROM python:3.11-slim AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.11-slim AS runtime
+
+# Создать non-root пользователя
+RUN groupadd --gid 1001 appgroup \
+ && useradd  --uid 1001 \
+             --gid appgroup \
+             --no-create-home \
+             --shell /sbin/nologin \
+             appuser
+
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY app/ .
+RUN chown -R appuser:appgroup /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# Переключиться на non-root
+USER appuser
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 7.2 Запустить и проверить
+
+```bash
+# Собрать образ
+docker build -t secureapp:latest .
+
+# Проверить что контейнер НЕ запускается от root
+docker run --rm secureapp:latest whoami
+# Ожидаемый вывод: appuser
+
+# Проверить UID
+docker run --rm secureapp:latest id
+# uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+
+# Запустить через docker-compose
+docker-compose up -d
+
+# Проверить запущенные контейнеры
+docker ps
+docker inspect secureapp | grep -i user
+```
+
+---
+
+## 8. Логи без чувствительных данных
+
+### 8.1 Настройка Python логгера в приложении
+
+```python
+# app/logger.py
+import logging
+import re
+
+class SensitiveDataFilter(logging.Filter):
+    """Фильтр — удаляет пароли и токены из логов."""
+
+    PATTERNS = [
+        (re.compile(r'password=[^\s&]+',      re.IGNORECASE), 'password=***'),
+        (re.compile(r'"password"\s*:\s*"[^"]+"', re.IGNORECASE), '"password": "***"'),
+        (re.compile(r'token=[^\s&]+',          re.IGNORECASE), 'token=***'),
+        (re.compile(r'Bearer\s+[A-Za-z0-9._-]+'), 'Bearer ***'),
+        (re.compile(r'AKIA[0-9A-Z]{16}'),      'AWS_KEY_***'),
+    ]
+
+    def filter(self, record):
+        message = record.getMessage()
+        for pattern, replacement in self.PATTERNS:
+            message = pattern.sub(replacement, message)
+        record.msg = message
+        record.args = ()
+        return True
+
+# Настроить логгер
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+logger.addFilter(SensitiveDataFilter())
+```
+
+### 8.2 Проверка логов
+
+```bash
+# Посмотреть логи приложения
+docker logs secureapp 2>&1 | tail -20
+
+# Убедиться что паролей нет
+docker logs secureapp 2>&1 | grep -iE "(password|token|secret|key)" \
+  && echo "⚠️  Sensitive data in logs!" \
+  || echo "✅ No sensitive data in logs"
+
+# Логи Nginx — проверить формат
+tail -20 /var/log/nginx/access.log
+# Формат: IP - [дата] "METHOD /path HTTP/1.1" STATUS bytes "UA"
+# Query-параметры НЕ должны попадать в лог
+```
+
+---
+
+## 9. Дополнительный hardening (sysctl)
+
+```bash
+cat > /etc/sysctl.d/99-security.conf << 'EOF'
+# Защита от SYN flood
+net.ipv4.tcp_syncookies = 1
+
+# Защита от IP spoofing
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Запрет ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+
+# ASLR — рандомизация адресного пространства
+kernel.randomize_va_space = 2
+
+# Запрет core dumps от suid-программ
+fs.suid_dumpable = 0
+EOF
+
+# Применить без перезагрузки
+sysctl --system
+```
+
+---
+
+## 10. Итоговая проверка
+
+```bash
+echo "=== Hardening Checklist ==="
+
+# Пользователь приложения
+id appuser && echo "✅ appuser exists"
+
+# SSH порт
+ss -tlnp | grep 2222 && echo "✅ SSH on port 2222"
+
+# UFW
+ufw status | grep -q "Status: active" && echo "✅ UFW active"
+
+# fail2ban
+systemctl is-active fail2ban && echo "✅ fail2ban running"
+
+# Nginx
+nginx -t 2>&1 | grep -q "successful" && echo "✅ Nginx config valid"
+
+# Docker non-root
+docker run --rm secureapp:latest whoami | grep -v root && echo "✅ Container non-root"
+
+# Security headers
+curl -sI http://localhost | grep -q "X-Frame-Options" && echo "✅ Security headers present"
+
+echo "=== Checklist complete ==="
+```
+
+---
+
+## Порядок выполнения
+
+```
+1. apt update && upgrade
+2. useradd appuser
+3. SSH: добавить ключ → изменить конфиг → перезапустить
+4. UFW: настроить правила → включить
+5. fail2ban: создать jail.local → перезапустить
+6. Nginx: создать конфиг → проверить → reload
+7. Docker: собрать образ → проверить non-root → запустить
+8. Логи: добавить фильтр → проверить
+9. sysctl: применить
+10. Итоговая проверка чеклиста
